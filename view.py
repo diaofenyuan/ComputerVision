@@ -1,793 +1,1125 @@
+# view.py
 # -*- coding: utf-8 -*-
 """
-OBS 虚拟摄像头 + OpenCV + YOLOv8 (Det Track + Pose ROI)
-退出：按 '-' 或 ESC
+多路摄像头实时摔倒检测（YOLOv11 Pose + OpenCV）+ pushplus 微信推送
+并集成：训练好的“摔倒 vs 躺下”事件分类器（joblib）
+
+依赖：
+pip install ultralytics opencv-python requests joblib scikit-learn
+（建议）pip install lapx   # 用于跟踪关联更稳定（可选）
+
+训练模型（joblib）说明：
+- 训练脚本输出：fall_event_clf.joblib（或你自定义名字）
+- 该分类器用于区分“摔倒（快倒下）”与“躺下（慢慢躺）”
+- 运行时对每个 track_id 维护滑动窗口特征，并输出摔倒概率
+
+运行：
+python view.py
 """
 
+import os
 import time
+import math
+import threading
+from dataclasses import dataclass, field
+from typing import List, Dict, Tuple, Optional, Deque
+from collections import deque
+
 import cv2
 import numpy as np
+import requests
+
+# Ultralytics YOLO
 from ultralytics import YOLO
 
-# ---------------------------
-# 参数
-# ---------------------------
-CAMERA_INDEX_PREFER = 0
+# UI
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
 
-REQUEST_WIDTH = 2560
-REQUEST_HEIGHT = 1440
-
-MAX_WINDOW_LONG_SIDE = 1280
-
-# ---------------------------
-# 模型选择
-# ---------------------------
-DET_MODEL_WEIGHTS = "yolov8n.pt"
-POSE_MODEL_WEIGHTS = "yolov8n-pose.pt"
-
-PERSON_CLASS_ID = 0
-TRACKER_CFG = "bytetrack.yaml"
-
-# ---------------------------
-# 推理与性能参数
-# ---------------------------
-DET_CONF = 0.33
-DET_IOU = 0.55
-MAX_DET = 30
-
-DET_IMGSZ = 680
-DET_INFER_MAX_LONG_SIDE = 1280  # 0 不缩放
-
-POSE_CONF = 0.25
-POSE_IMGSZ = 320
-POSE_STRIDE = 1           # 每个 tid 至少隔 N 帧更新一次
-POSE_MAX_PEOPLE = 20
-
-# 关键点最低置信度（侧脸放宽一点）
-KP_MIN_CONF = 0.10
-
-# 头框 EMA 平滑系数
-HEAD_EMA_ALPHA = 0.18
-
-# 轨迹丢失后保留多少帧再清理
-STALE_FRAMES = 60
-
-# 新头框与旧头框差太大则重置平滑
-IOU_RESET_THRESH = 0.12
-
-CROP_PAD_RATIO = 0.08
+# ML classifier
+import joblib
 
 
-# ---------------------------
-# 摄像头相关
-# ---------------------------
-def open_camera(prefer_index: int = 0):
-    """尝试打开摄像头（优先 prefer_index），失败则扫描 0~9；Windows 优先 DSHOW。"""
+# ===========================
+# pushplus 推送
+# ===========================
+
+def pushplus_send(token: str, title: str, content_html: str) -> bool:
+    """pushplus 推送（失败返回 False）"""
+    url = "http://www.pushplus.plus/send/"
+    payload = {"token": token, "title": title, "content": content_html, "template": "html"}
+    try:
+        r = requests.post(url, json=payload, timeout=5)
+        return (r.status_code == 200)
+    except Exception:
+        return False
+
+
+# ===========================
+# 数学/特征
+# ===========================
+
+def angle_to_vertical(dx: float, dy: float) -> float:
+    """向量与竖直向下方向(0,1)夹角：0=竖直，90=水平"""
+    norm = math.sqrt(dx * dx + dy * dy) + 1e-9
+    cosv = dy / norm
+    cosv = max(-1.0, min(1.0, cosv))
+    return math.degrees(math.acos(cosv))
+
+
+def safe_use_cv2_cuda_resize(frame: np.ndarray, out_w: int, out_h: int) -> np.ndarray:
+    """若 OpenCV 支持 CUDA 则用 GPU resize，否则回退 CPU"""
+    try:
+        if hasattr(cv2, "cuda") and cv2.cuda.getCudaEnabledDeviceCount() > 0:
+            gm = cv2.cuda_GpuMat()
+            gm.upload(frame)
+            rgm = cv2.cuda.resize(gm, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
+            return rgm.download()
+    except Exception:
+        pass
+    return cv2.resize(frame, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
+
+
+def mosaic(frames: List[np.ndarray], target_w: int = 1600) -> np.ndarray:
+    """多路画面拼接"""
+    if not frames:
+        return np.zeros((720, 1280, 3), dtype=np.uint8)
+    n = len(frames)
+    cols = int(math.ceil(math.sqrt(n)))
+    rows = int(math.ceil(n / cols))
+
+    h0, w0 = frames[0].shape[:2]
+    cell_w = max(320, target_w // cols)
+    cell_h = int(cell_w * h0 / max(1, w0))
+
+    canvas = np.zeros((rows * cell_h, cols * cell_w, 3), dtype=np.uint8)
+    for i, f in enumerate(frames):
+        r, c = divmod(i, cols)
+        resized = safe_use_cv2_cuda_resize(f, cell_w, cell_h)
+        y1, y2 = r * cell_h, (r + 1) * cell_h
+        x1, x2 = c * cell_w, (c + 1) * cell_w
+        canvas[y1:y2, x1:x2] = resized
+    return canvas
+
+
+def calc_pose_metrics(kpts_xy: np.ndarray, box_xyxy: np.ndarray) -> Dict[str, float]:
+    """
+    从姿态关键点 + 框计算核心指标（和你训练脚本保持一致）
+    返回：
+      bh, wh_ratio, body_ang, head_hip_v_rel, cy
+    """
+    x1, y1, x2, y2 = box_xyxy.astype(float)
+    bw = max(1.0, x2 - x1)
+    bh = max(1.0, y2 - y1)
+    wh_ratio = bw / bh
+
+    # COCO 17点索引：0鼻子，5左肩，6右肩，11左髋，12右髋
+    nose = kpts_xy[0]
+    l_sh, r_sh = kpts_xy[5], kpts_xy[6]
+    l_hip, r_hip = kpts_xy[11], kpts_xy[12]
+
+    sh_center = (l_sh + r_sh) / 2.0
+    hip_center = (l_hip + r_hip) / 2.0
+
+    dx = float(hip_center[0] - sh_center[0])
+    dy = float(hip_center[1] - sh_center[1])
+    body_ang = angle_to_vertical(dx, dy)
+
+    head_to_hip_v = abs(float(nose[1] - hip_center[1]))
+    head_hip_v_rel = head_to_hip_v / (bh + 1e-9)
+
+    cy = (y1 + y2) / 2.0
+
+    return {
+        "bh": float(bh),
+        "wh_ratio": float(wh_ratio),
+        "body_ang": float(body_ang),
+        "head_hip_v_rel": float(head_hip_v_rel),
+        "cy": float(cy),
+        "box_x1": float(x1),
+        "box_y1": float(y1),
+        "box_x2": float(x2),
+        "box_y2": float(y2),
+    }
+
+
+def is_lying_like(m: Dict[str, float],
+                  wh_th: float = 1.35,
+                  ang_th: float = 58.0,
+                  headhip_rel_th: float = 0.16,
+                  score_th: int = 2) -> bool:
+    """单帧躺姿判定（偏严格，减少误报）"""
+    cond_box = m["wh_ratio"] > wh_th
+    cond_ang = m["body_ang"] > ang_th
+    cond_headhip = m["head_hip_v_rel"] < headhip_rel_th
+    score = int(cond_box) + int(cond_ang) + int(cond_headhip)
+    return score >= score_th
+
+
+def pctl(x: np.ndarray, q: float) -> float:
+    return float(np.percentile(x, q))
+
+
+def build_clip_feature_from_window(window: List[Dict[str, float]], sample_fps: float) -> np.ndarray:
+    """
+    将“滑动窗口帧序列”转换为训练时同款的特征向量
+    window: 每帧一个 metrics dict（含 body_ang, wh_ratio, head_hip_v_rel, cy, bh）
+    """
+    if len(window) < 8:
+        return np.zeros((19,), dtype=np.float32)
+
+    dt = 1.0 / max(1e-6, float(sample_fps))
+
+    body_ang_seq = np.array([w["body_ang"] for w in window], dtype=np.float32)
+    wh_ratio_seq = np.array([w["wh_ratio"] for w in window], dtype=np.float32)
+    headhip_seq = np.array([w["head_hip_v_rel"] for w in window], dtype=np.float32)
+    cy_seq = np.array([w["cy"] for w in window], dtype=np.float32)
+    bh_seq = np.array([w["bh"] for w in window], dtype=np.float32)
+
+    lying_seq = np.array([1.0 if w.get("lying_like", False) else 0.0 for w in window], dtype=np.float32)
+
+    ang_speed = np.diff(body_ang_seq) / dt
+    wh_speed = np.diff(wh_ratio_seq) / dt
+    vy = np.diff(cy_seq) / dt
+    vy_norm = vy / (bh_seq[1:] + 1e-6)
+
+    idxs = np.where(lying_seq > 0.5)[0]
+    time_to_lying = float(idxs[0] * dt) if len(idxs) > 0 else float(len(lying_seq) * dt)
+
+    feats = [
+        float(np.mean(body_ang_seq)),
+        float(np.max(body_ang_seq)),
+        pctl(body_ang_seq, 95),
+
+        float(np.mean(wh_ratio_seq)),
+        float(np.max(wh_ratio_seq)),
+        pctl(wh_ratio_seq, 95),
+
+        float(np.mean(headhip_seq)),
+        float(np.min(headhip_seq)),
+
+        float(np.mean(ang_speed)),
+        float(np.max(ang_speed)),
+        pctl(ang_speed, 95),
+
+        float(np.mean(vy_norm)),
+        float(np.max(vy_norm)),
+        pctl(vy_norm, 95),
+
+        float(np.mean(wh_speed)),
+        float(np.max(wh_speed)),
+        pctl(wh_speed, 95),
+
+        float(np.mean(lying_seq)),
+        float(time_to_lying),
+    ]
+    return np.array(feats, dtype=np.float32)
+
+
+
+# ===========================
+# 摄像头自动检测工具（Windows/OBS 兼容）
+# ===========================
+
+def open_camera_auto(prefer: int = 0, max_index: int = 10):
+    """自动打开可用摄像头。
+    - prefer：优先尝试的索引（比如 0）
+    - max_index：最多扫描到哪个索引（不含）
+    返回：(cap, picked_index)；失败返回 (None, -1)
+    说明：
+    - Windows 下优先尝试 DSHOW / MSMF 两种后端，常见于实体摄像头与 OBS 虚拟摄像头
+    """
+    # 先构造尝试顺序：优先 prefer，其余按 0..max_index-1
+    order = [prefer] + [i for i in range(max_index) if i != prefer]
+
     backends = []
+    # 有些 OpenCV 编译不包含某些后端，这里用 getattr 防御
     if hasattr(cv2, "CAP_DSHOW"):
         backends.append(cv2.CAP_DSHOW)
     if hasattr(cv2, "CAP_MSMF"):
         backends.append(cv2.CAP_MSMF)
-    if hasattr(cv2, "CAP_AVFOUNDATION"):
-        backends.append(cv2.CAP_AVFOUNDATION)
-    if hasattr(cv2, "CAP_V4L2"):
-        backends.append(cv2.CAP_V4L2)
-    backends.append(0)
+    # 最后兜底：默认后端
+    backends.append(None)
 
-    def try_open(idx: int):
+    for idx in order:
         for be in backends:
-            cap = cv2.VideoCapture(idx, be) if be != 0 else cv2.VideoCapture(idx)
-            if cap.isOpened():
+            try:
+                cap = cv2.VideoCapture(idx, be) if be is not None else cv2.VideoCapture(idx)
+            except Exception:
+                cap = None
+            if cap is not None and cap.isOpened():
+                return cap, idx
+            try:
+                if cap is not None:
+                    cap.release()
+            except Exception:
+                pass
+
+    return None, -1
+
+
+# ===========================
+# 摄像头读取线程（自动重连）
+# ===========================
+
+class CameraReader(threading.Thread):
+    """单路摄像头读取：只保留最新帧，尽量低延迟，支持断流重连"""
+    def __init__(self,
+                 cam_id: int,
+                 source,
+                 width: int,
+                 height: int,
+                 fps: int,
+                 buffer_size: int,
+                 name: str = ""):
+        super().__init__(daemon=True)
+        self.cam_id = cam_id
+        self.source = source
+        self.width = width
+        self.height = height
+        self.fps = fps
+        self.buffer_size = buffer_size
+        self.name = name or f"cam{cam_id}"
+
+        self.cap: Optional[cv2.VideoCapture] = None
+        self.lock = threading.Lock()
+        self.latest_frame: Optional[np.ndarray] = None
+        self.latest_ts: float = 0.0
+        self.stop_flag = False
+
+    def open(self) -> bool:
+        """打开视频源
+        - 如果 source 是数字（例如 0/1/2 或字符串 "0"），则按“摄像头索引”处理，并自动扫描可用设备
+        - 否则按“视频文件/RTSP”等字符串源处理
+        """
+        # 1) 处理本地摄像头：允许 source 传入 int 或者 "0" 这样的数字字符串
+        src = self.source
+        cam_index: Optional[int] = None
+        if isinstance(src, int):
+            cam_index = int(src)
+        elif isinstance(src, str) and src.strip().isdigit():
+            cam_index = int(src.strip())
+
+        if cam_index is not None:
+            cap, picked = open_camera_auto(prefer=cam_index, max_index=10)
+            if cap is None:
+                return False
+            if picked != cam_index:
+                print(f"[信息] {self.name} 自动切换摄像头索引：{cam_index} -> {picked}")
+            self.source = picked  # 记录为实际索引
+            self.cap = cap
+        else:
+            # 2) RTSP/视频文件：尽量用 FFMPEG 后端（RTSP 更常见）
+            try:
+                self.cap = cv2.VideoCapture(self.source, cv2.CAP_FFMPEG)
+            except Exception:
+                self.cap = cv2.VideoCapture(self.source)
+
+        # 通用参数设置
+        try:
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, self.buffer_size)
+        except Exception:
+            pass
+
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+        try:
+            self.cap.set(cv2.CAP_PROP_FPS, self.fps)
+        except Exception:
+            pass
+
+        return bool(self.cap is not None and self.cap.isOpened())
+
+    def run(self):
+        retry_wait = 1.0
+        max_wait = 10.0
+
+        while not self.stop_flag:
+            if self.cap is None or (not self.cap.isOpened()):
+                ok = self.open()
+                if not ok:
+                    print(f"[警告] 打开失败，{self.name} 将在 {retry_wait:.1f}s 后重试：{self.source}")
+                    time.sleep(retry_wait)
+                    retry_wait = min(max_wait, retry_wait * 1.5)
+                    continue
+                else:
+                    print(f"[信息] 打开成功：{self.name} -> {self.source}")
+                    retry_wait = 1.0
+
+            ok, frame = self.cap.read()
+            if not ok or frame is None:
                 try:
-                    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                    self.cap.release()
                 except Exception:
                     pass
-                ok, frame = cap.read()
-                if ok and frame is not None:
-                    return cap, be
-            cap.release()
-        return None, None
+                self.cap = None
+                time.sleep(0.2)
+                continue
 
-    cap, be = try_open(prefer_index)
-    if cap is not None:
-        return cap, prefer_index, be
+            ts = time.time()
+            with self.lock:
+                self.latest_frame = frame
+                self.latest_ts = ts
 
-    for i in range(10):
-        if i == prefer_index:
-            continue
-        cap, be = try_open(i)
-        if cap is not None:
-            return cap, i, be
+        try:
+            if self.cap is not None:
+                self.cap.release()
+        except Exception:
+            pass
 
-    raise RuntimeError("无法打开 OBS 虚拟摄像头：请确认 OBS 已启动虚拟摄像头，或调整 camera index。")
+    def get_latest(self) -> Tuple[Optional[np.ndarray], float]:
+        with self.lock:
+            if self.latest_frame is None:
+                return None, 0.0
+            return self.latest_frame.copy(), self.latest_ts
 
-
-def request_resolution(cap: cv2.VideoCapture, w: int, h: int):
-    """向摄像头请求分辨率（可能被忽略），返回 CAP_PROP（不一定等于真实帧）。"""
-    try:
-        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-    except Exception:
-        pass
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, int(w))
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(h))
-    try:
-        cap.set(cv2.CAP_PROP_FPS, 60)
-    except Exception:
-        pass
-    return cap.get(cv2.CAP_PROP_FRAME_WIDTH), cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+    def stop(self):
+        self.stop_flag = True
 
 
-def warmup_read(cap: cv2.VideoCapture, n: int = 8):
-    """读几帧让分辨率稳定。"""
-    frame = None
-    for _ in range(max(1, n)):
-        ok, f = cap.read()
-        if ok and f is not None:
-            frame = f
-    if frame is None:
-        raise RuntimeError("摄像头读帧失败。")
-    return frame
+# ===========================
+# 每个 track 的状态
+# ===========================
+
+@dataclass
+class TrackState:
+    # 躺姿连续帧
+    consec_lying: int = 0
+
+    # 推送冷却
+    last_push_ts: float = 0.0
+
+    # 最近出现时间（用于清理）
+    last_seen_ts: float = 0.0
+
+    # 规则法：最近一次“快速倒下事件”时间
+    last_fall_event_ts: float = 0.0
+
+    # 规则法：上一帧用于速度
+    prev_ts: float = 0.0
+    prev_body_ang: float = 0.0
+    prev_cy: float = 0.0
+    prev_wh_ratio: float = 0.0
+    prev_is_standlike: bool = False
+
+    # ML：滑动窗口（存 metrics）
+    window: Deque[Dict[str, float]] = field(default_factory=lambda: deque(maxlen=20))  # 默认约2秒(10fps)
 
 
-# ---------------------------
-# 工具函数
-# ---------------------------
-def get_device_and_half():
-    """有 CUDA -> (0, True)，否则 ('cpu', False)。"""
-    try:
+# ===========================
+# 视频处理主线程
+# ===========================
+
+class VideoProcessor(threading.Thread):
+    """
+    后台线程：多摄像头采集 -> YOLO pose 跟踪推理 -> 摔倒判定 -> 显示/推送
+    """
+    def __init__(self,
+                 sources: List[str],
+                 yolo_model_path: str,
+                 algo_mode: str,
+                 clf_path: str,
+                 push_token: str,
+                 infer_imgsz: int = 960,
+                 conf_thres: float = 0.40,
+                 use_half: bool = True,
+                 capture_width: int = 1920,
+                 capture_height: int = 1080,
+                 capture_fps: int = 30,
+                 buffer_size: int = 1,
+                 # 误报优先：严格参数
+                 fall_pose_consec_frames: int = 12,
+                 fall_event_window_sec: float = 1.0,
+                 push_cooldown_sec: int = 45,
+                 ang_stand_max: float = 32.0,
+                 ang_lying_min: float = 58.0,
+                 wh_ratio_lying_th: float = 1.35,
+                 head_hip_v_rel_th: float = 0.16,
+                 lying_score_th: int = 2,
+                 ang_speed_th: float = 190.0,
+                 vy_norm_th: float = 1.45,
+                 wh_speed_th: float = 1.80,
+                 # ML 阈值（误报优先：阈值设高）
+                 ml_prob_thres: float = 0.90,
+                 ml_sample_fps: float = 10.0,
+                 ):
+        super().__init__(daemon=True)
+        self.sources = sources
+        self.yolo_model_path = yolo_model_path
+        self.algo_mode = algo_mode
+        self.clf_path = clf_path
+        self.push_token = push_token
+
+        self.infer_imgsz = infer_imgsz
+        self.conf_thres = conf_thres
+        self.use_half = use_half
+
+        self.capture_width = capture_width
+        self.capture_height = capture_height
+        self.capture_fps = capture_fps
+        self.buffer_size = buffer_size
+
+        self.fall_pose_consec_frames = fall_pose_consec_frames
+        self.fall_event_window_sec = fall_event_window_sec
+        self.push_cooldown_sec = push_cooldown_sec
+
+        self.ang_stand_max = ang_stand_max
+        self.ang_lying_min = ang_lying_min
+        self.wh_ratio_lying_th = wh_ratio_lying_th
+        self.head_hip_v_rel_th = head_hip_v_rel_th
+        self.lying_score_th = lying_score_th
+
+        self.ang_speed_th = ang_speed_th
+        self.vy_norm_th = vy_norm_th
+        self.wh_speed_th = wh_speed_th
+
+        self.ml_prob_thres = ml_prob_thres
+        self.ml_sample_fps = ml_sample_fps
+
+        self.stop_flag = False
+        self.readers: List[CameraReader] = []
+        self.states_per_cam: List[Dict[int, TrackState]] = []
+
+        self.model: Optional[YOLO] = None
+        self.clf = None  # joblib classifier
+        self.device = None
+
+        self.last_canvas = None
+        self.last_status_text = ""
+
+    def stop(self):
+        self.stop_flag = True
+
+    def _check_cuda_or_raise(self):
+        """你说必须 CUDA：这里强制检查"""
         import torch
-        if torch.cuda.is_available():
-            return 0, True
-    except Exception:
-        pass
-    return "cpu", False
-
-
-def calc_display_size(w: int, h: int, max_long_side: int):
-    """等比缩小窗口，不改变处理分辨率。"""
-    long_side = max(w, h)
-    if long_side <= max_long_side:
-        return w, h
-    scale = max_long_side / float(long_side)
-    dw = max(320, int(w * scale))
-    dh = max(240, int(h * scale))
-    return dw, dh
-
-
-def clamp_box_draw(x1, y1, x2, y2, w, h):
-    """绘制用：限制到 [0, W-1]/[0, H-1]。"""
-    x1 = float(max(0, min(w - 1, x1)))
-    y1 = float(max(0, min(h - 1, y1)))
-    x2 = float(max(0, min(w - 1, x2)))
-    y2 = float(max(0, min(h - 1, y2)))
-    if x2 < x1:
-        x1, x2 = x2, x1
-    if y2 < y1:
-        y1, y2 = y2, y1
-    return x1, y1, x2, y2
-
-
-def clamp_box_crop(x1, y1, x2, y2, w, h):
-    """
-    裁剪用：右下角切片是开区间，x2/y2 用 [0, W]/[0, H] 更稳，不容易切掉边缘。
-    """
-    x1 = float(max(0, min(w, x1)))
-    y1 = float(max(0, min(h, y1)))
-    x2 = float(max(0, min(w, x2)))
-    y2 = float(max(0, min(h, y2)))
-    if x2 < x1:
-        x1, x2 = x2, x1
-    if y2 < y1:
-        y1, y2 = y2, y1
-    return x1, y1, x2, y2
-
-
-def iou(a, b):
-    """a,b: [x1,y1,x2,y2]"""
-    ax1, ay1, ax2, ay2 = a
-    bx1, by1, bx2, by2 = b
-    ix1 = max(ax1, bx1)
-    iy1 = max(ay1, by1)
-    ix2 = min(ax2, bx2)
-    iy2 = min(ay2, by2)
-    iw = max(0.0, ix2 - ix1)
-    ih = max(0.0, iy2 - iy1)
-    inter = iw * ih
-    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
-    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
-    union = area_a + area_b - inter + 1e-6
-    return inter / union
-
-
-def ema_update(prev: np.ndarray, cur: np.ndarray, alpha: float) -> np.ndarray:
-    return (1.0 - alpha) * prev + alpha * cur
-
-
-def maybe_resize_for_det(frame, max_long_side: int):
-    """det/track 可选缩放推理。返回 (frame_det, scale) ，原图坐标 = det坐标 / scale"""
-    if max_long_side is None or max_long_side <= 0:
-        return frame, 1.0
-    h, w = frame.shape[:2]
-    long_side = max(w, h)
-    if long_side <= max_long_side:
-        return frame, 1.0
-    scale = max_long_side / float(long_side)
-    dw = int(w * scale)
-    dh = int(h * scale)
-    frame_det = cv2.resize(frame, (dw, dh), interpolation=cv2.INTER_LINEAR)
-    return frame_det, scale
-
-
-def crop_with_pad(frame, box_xyxy, pad_ratio: float):
-    """按 box 裁剪并加 padding。返回 crop 和 (ox, oy) 偏移。"""
-    H, W = frame.shape[:2]
-    x1, y1, x2, y2 = box_xyxy
-    bw = max(2.0, x2 - x1)
-    bh = max(2.0, y2 - y1)
-    pad = pad_ratio * max(bw, bh)
-
-    cx1 = x1 - pad
-    cy1 = y1 - pad
-    cx2 = x2 + pad
-    cy2 = y2 + pad
-    cx1, cy1, cx2, cy2 = clamp_box_crop(cx1, cy1, cx2, cy2, W, H)
-
-    ix1, iy1, ix2, iy2 = map(int, [cx1, cy1, cx2, cy2])
-    if ix2 <= ix1 + 1 or iy2 <= iy1 + 1:
-        return None, 0, 0
-    crop = frame[iy1:iy2, ix1:ix2].copy()
-    return crop, ix1, iy1
-
-
-def _kp_ok(kconf, idx, thr):
-    if kconf is None:
-        return True
-    return float(kconf[idx]) >= thr
-
-
-# ---------------------------
-# ROI pose 里可能有多人，挑 ROI 主人
-# ---------------------------
-def pick_best_pose_index(pr, cw, ch):
-    if getattr(pr, "boxes", None) is None or pr.boxes is None or len(pr.boxes) == 0:
-        return 0
-    try:
-        b = pr.boxes.xyxy.cpu().numpy()
-        c = pr.boxes.conf.cpu().numpy() if pr.boxes.conf is not None else None
-    except Exception:
-        return 0
-
-    cx0, cy0 = cw * 0.5, ch * 0.5
-    best_i, best_score = 0, -1e18
-    for i, (x1, y1, x2, y2) in enumerate(b):
-        bx = (x1 + x2) * 0.5
-        by = (y1 + y2) * 0.5
-        area = max(0.0, (x2 - x1)) * max(0.0, (y2 - y1))
-        dist2 = (bx - cx0) ** 2 + (by - cy0) ** 2
-        conf = float(c[i]) if c is not None else 1.0
-        score = -dist2 + 0.10 * area + 2000.0 * conf
-        if score > best_score:
-            best_score = score
-            best_i = i
-    return best_i
-
-
-# ---------------------------
-# “更紧的整头框”（ROI 坐标系）
-# - 核心改动：用 median 而不是 max，肩宽权重更小，且加上下限更紧/上限防爆
-# ---------------------------
-def head_box_full_from_pose(cw, ch, kxy, kconf=None):
-    px1, py1, px2, py2 = 0.0, 0.0, float(cw), float(ch)
-    pw, ph = px2 - px1, py2 - py1
-
-    def get_pt(i):
-        if not _kp_ok(kconf, i, KP_MIN_CONF):
-            return None
-        x, y = float(kxy[i][0]), float(kxy[i][1])
-        margin = 12.0
-        if x < px1 - margin or x > px2 + margin or y < py1 - margin or y > py2 + margin:
-            return None
-        return np.array([x, y], dtype=np.float32)
-
-    # COCO keypoints:
-    # 0 nose, 1 l_eye, 2 r_eye, 3 l_ear, 4 r_ear, 5 l_shoulder, 6 r_shoulder
-    nose = get_pt(0)
-    leye = get_pt(1)
-    reye = get_pt(2)
-    lear = get_pt(3)
-    rear = get_pt(4)
-    lsh = get_pt(5)
-    rsh = get_pt(6)
-
-    # --- 定位中心 & 顶部参考 y（先粗略）
-    if lear is not None and rear is not None:
-        center = (lear + rear) * 0.5
-        top_ref_y = min(
-            lear[1], rear[1],
-            leye[1] if leye is not None else 1e9,
-            reye[1] if reye is not None else 1e9,
-            nose[1] if nose is not None else 1e9
-        )
-    elif leye is not None and reye is not None:
-        center = (leye + reye) * 0.5
-        top_ref_y = min(leye[1], reye[1], nose[1] if nose is not None else 1e9)
-    elif (lear is not None) ^ (rear is not None):
-        ear = lear if lear is not None else rear
-        ref = nose if nose is not None else (leye if leye is not None else reye)
-        if ref is not None:
-            center = (ear + ref) * 0.5
-            top_ref_y = min(ear[1], ref[1])
-        else:
-            center = ear
-            top_ref_y = ear[1]
-    elif nose is not None:
-        center = nose
-        top_ref_y = nose[1]
-    else:
-        center = np.array([pw * 0.5, ph * 0.18], dtype=np.float32)
-        top_ref_y = float(ph * 0.10)
-
-    cx, cy = float(center[0]), float(center[1])
-
-    # --- 估计头宽：更紧、更稳（median + clip）
-    cand = []
-    if lear is not None and rear is not None:
-        cand.append(float(np.linalg.norm(lear - rear)) * 1.55)   # 原 1.75
-    if leye is not None and reye is not None:
-        cand.append(float(np.linalg.norm(leye - reye)) * 2.80)   # 原 3.10
-    if lsh is not None and rsh is not None:
-        cand.append(float(np.linalg.norm(lsh - rsh)) * 0.38)     # 原 0.50（肩宽最容易拉爆）
-
-    if cand:
-        base_w = float(np.median(cand))  # 原 max(cand) 很容易变大
-    else:
-        base_w = 0.48 * pw               # 原 0.62 * pw
-
-    # 高度更紧：避免吃到上半身
-    base_h = 1.00 * base_w               # 原 1.12
-
-    # 更紧下限 + 上限防爆（关键：原 min_h=0.42*ph 会直接把上半身吃进去）
-    min_w = 0.32 * pw
-    min_h = 0.22 * ph
-    max_w = 0.68 * pw
-    max_h = 0.52 * ph
-
-    head_w = float(np.clip(base_w, min_w, max_w))
-    head_h = float(np.clip(base_h, min_h, max_h))
-
-    # --- 侧脸：单耳时轻推（小幅度，更精准）
-    if (lear is not None) ^ (rear is not None):
-        ear = lear if lear is not None else rear
-        ref = nose if nose is not None else (leye if leye is not None else reye)
-        if ref is not None:
-            v = ear - ref
-            n = float(np.linalg.norm(v)) + 1e-6
-            v = v / n
-            cx += float(v[0]) * 0.08 * head_w
-            cy += float(v[1]) * 0.02 * head_h
-
-    # 顶部参考更稳：鼻子存在时，允许略上探；单耳再略上提，避免侧脸“缩到眼部”
-    if nose is not None:
-        top_ref_y = min(float(top_ref_y), float(nose[1]) - 0.10 * head_h)
-    if (lear is not None) ^ (rear is not None):
-        top_ref_y = float(top_ref_y) - 0.03 * head_h
-
-    # 头顶上抬：略加大（更贴头顶，同时底部不会太深）
-    hy1 = float(top_ref_y) - 0.34 * head_h
-    hy2 = hy1 + head_h
-
-    hx1 = cx - 0.5 * head_w
-    hx2 = cx + 0.5 * head_w
-
-    return hx1, hy1, hx2, hy2
-
-
-def head_box_fallback_full(px1, py1, px2, py2):
-    """关键点不可用时的更紧 fallback（避免吃到上半身）。"""
-    pw = px2 - px1
-    ph = py2 - py1
-    cx = (px1 + px2) / 2.0
-
-    head_h = 0.30 * ph   # 原 0.40
-    head_w = 0.52 * pw   # 原 0.62
-
-    hx1 = cx - 0.5 * head_w
-    hx2 = cx + 0.5 * head_w
-
-    # 顶部稍低于人框顶，减少把上方空白/上半身吃进去的概率
-    hy1 = py1 + 0.02 * ph
-    hy2 = hy1 + head_h
-    return hx1, hy1, hx2, hy2
-
-
-# ---------------------------
-# 主程序
-# ---------------------------
-def main():
-    cap, used_index, used_backend = open_camera(CAMERA_INDEX_PREFER)
-    print(f"[INFO] Camera opened. index={used_index}, backend={used_backend}")
-
-    print(f"[INFO] Requesting resolution: {REQUEST_WIDTH}x{REQUEST_HEIGHT}")
-    prop_w, prop_h = request_resolution(cap, REQUEST_WIDTH, REQUEST_HEIGHT)
-    print(f"[INFO] CAP_PROP after set: {int(prop_w)}x{int(prop_h)} (may be inaccurate)")
-
-    first_frame = warmup_read(cap, n=8)
-    H0, W0 = first_frame.shape[:2]
-    print(f"[INFO] REAL frame resolution: {W0}x{H0}")
-    print("[INFO] Press '-' or ESC to quit.")
-
-    device, half_ok = get_device_and_half()
-    print(f"[INFO] Device: {device} | FP16: {half_ok}")
-
-    det_model = YOLO(DET_MODEL_WEIGHTS)
-    pose_model = YOLO(POSE_MODEL_WEIGHTS)
-
-    print(f"[INFO] Det model:  {DET_MODEL_WEIGHTS} | imgsz={DET_IMGSZ} | tracker={TRACKER_CFG}")
-    print(f"[INFO] Pose model: {POSE_MODEL_WEIGHTS} | pose_imgsz={POSE_IMGSZ} | stride={POSE_STRIDE}")
-
-    win_name = "OBS + YOLOv8 (DetTrack + PoseROI) FULL-HEAD (TIGHT)"
-    cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
-    disp_w, disp_h = calc_display_size(W0, H0, MAX_WINDOW_LONG_SIDE)
-    cv2.resizeWindow(win_name, disp_w, disp_h)
-    print(f"[INFO] Window: {disp_w}x{disp_h} (frame stays {W0}x{H0})")
-
-    # 只对“有稳定 tid”的人做 EMA 状态
-    head_state = {}        # tid -> bbox(float32[4])
-    last_seen = {}         # tid -> frame_idx
-    last_pose_update = {}  # tid -> frame_idx
-
-    frame_idx = 0
-    fps = 0.0
-    last_t = time.time()
-
-    frame = first_frame
-
-    while True:
-        if frame is None:
-            ok, frame = cap.read()
-            if not ok or frame is None:
-                print("[WARN] Failed to read frame.")
-                break
-
-        H, W = frame.shape[:2]
-
-        # det/track 可选缩放推理
-        frame_det, det_scale = maybe_resize_for_det(frame, DET_INFER_MAX_LONG_SIDE)
-
-        # 1) Det Track：人框 + tid
-        results_det = det_model.track(
-            frame_det,
-            conf=DET_CONF,
-            iou=DET_IOU,
-            imgsz=DET_IMGSZ,
-            device=device,
-            half=half_ok,
-            persist=True,
-            verbose=False,
-            classes=[PERSON_CLASS_ID],
-            max_det=MAX_DET,
-            tracker=TRACKER_CFG,
-        )
-
-        if not results_det or len(results_det) == 0:
-            det = None
-        else:
-            det = results_det[0]
-
-        tracks = {}        # tid(int) -> (person_box_xyxy, score)
-        tracks_noid = []   # [(person_box_xyxy, score)] 没有稳定 tid 的人（不进 EMA）
-
-        if det is not None and det.boxes is not None and len(det.boxes) > 0:
-            boxes = det.boxes.xyxy
-            confs = det.boxes.conf
-            clss = det.boxes.cls
-
-            ids = None
-            if getattr(det.boxes, "id", None) is not None and det.boxes.id is not None:
-                try:
-                    ids = det.boxes.id
-                except Exception:
-                    ids = None
-
-            boxes = boxes.cpu().numpy()
-            confs = confs.cpu().numpy()
-            clss = clss.cpu().numpy()
-            if ids is not None:
-                try:
-                    ids = ids.cpu().numpy().astype(int)
-                except Exception:
-                    ids = None
-
-            for i, ((x1, y1, x2, y2), score, cls_id) in enumerate(zip(boxes, confs, clss)):
-                if int(cls_id) != PERSON_CLASS_ID:
-                    continue
-
-                # 映射回原图坐标
-                x1 /= det_scale
-                y1 /= det_scale
-                x2 /= det_scale
-                y2 /= det_scale
-
-                px1, py1, px2, py2 = clamp_box_draw(x1, y1, x2, y2, W, H)
-                pbox = np.array([px1, py1, px2, py2], dtype=np.float32)
-
-                if ids is None or i >= len(ids):
-                    tracks_noid.append((pbox, float(score)))
-                else:
-                    tid = int(ids[i])
-                    tracks[tid] = (pbox, float(score))
-                    last_seen[tid] = frame_idx
-
-        # 2) 决定本帧要对哪些（有 tid 的）人跑 pose（按 tid 隔帧 + 人多限制）
-        need_pose_tids = []
-        if tracks:
-            def rank_key(item):
-                tid, (b, s) = item
-                area = float(max(0.0, (b[2] - b[0])) * max(0.0, (b[3] - b[1])))
-                return (area, s)
-
-            sorted_tracks = sorted(tracks.items(), key=rank_key, reverse=True)
-
-            for tid, (pbox, score) in sorted_tracks:
-                last_upd = last_pose_update.get(tid, -10**9)
-                if (tid not in head_state) or ((frame_idx - last_upd) >= max(1, POSE_STRIDE)):
-                    need_pose_tids.append(tid)
-
-            if len(need_pose_tids) > POSE_MAX_PEOPLE:
-                keep = set([tid for tid, _ in sorted_tracks[:POSE_MAX_PEOPLE]])
-                need_pose_tids = [tid for tid in need_pose_tids if tid in keep]
-
-        # 2b) 没有 tid 的人：只在本帧做 pose（不做 EMA/不做 stride），数量也限制
-        need_pose_noid = []
-        if tracks_noid:
-            tracks_noid_sorted = sorted(
-                tracks_noid,
-                key=lambda bs: float(max(0.0, (bs[0][2]-bs[0][0])) * max(0.0, (bs[0][3]-bs[0][1]))),
-                reverse=True
+        if not (torch.cuda.is_available() and torch.cuda.device_count() > 0):
+            raise RuntimeError(
+                "CUDA 不可用：请确认你安装的是 cu128 版 torch，且 nvidia 驱动正常。"
             )
-            need_pose_noid = tracks_noid_sorted[:min(POSE_MAX_PEOPLE, len(tracks_noid_sorted))]
+        self.device = "cuda:0"
 
-        # 3) 对选中的人做 ROI pose（批量推理）
-        # 3a) 有 tid
-        if need_pose_tids:
-            crops = []
-            meta = []  # (tid, ox, oy, cw, ch)
-            for tid in need_pose_tids:
-                pbox, _ = tracks[tid]
-                crop, ox, oy = crop_with_pad(frame, pbox, CROP_PAD_RATIO)
-                if crop is None or crop.size == 0:
-                    continue
-                ch, cw = crop.shape[:2]
-                if cw < 10 or ch < 10:
-                    continue
-                crops.append(crop)
-                meta.append((tid, ox, oy, cw, ch))
+    def _load_models(self):
+        self._check_cuda_or_raise()
 
-            if crops:
-                pose_results = pose_model.predict(
-                    crops,
-                    conf=POSE_CONF,
-                    imgsz=POSE_IMGSZ,
-                    device=device,
-                    half=half_ok,
+        # 加载 YOLO
+        print(f"[信息] 加载 YOLO 模型：{self.yolo_model_path}")
+        self.model = YOLO(self.yolo_model_path)
+
+        # half 仅 GPU
+        self.use_half = bool(self.use_half)
+
+        # 加载分类器（可选）
+        if self.algo_mode in ("训练模型", "混合") and self.clf_path and os.path.isfile(self.clf_path):
+            print(f"[信息] 加载训练分类器：{self.clf_path}")
+            self.clf = joblib.load(self.clf_path)
+        else:
+            self.clf = None
+            if self.algo_mode in ("训练模型", "混合"):
+                print("[警告] 未加载训练分类器（joblib不存在或未选择），将无法使用训练模型模式。")
+
+    def _start_readers(self):
+        self.readers = []
+        for i, src in enumerate(self.sources):
+            rd = CameraReader(
+                cam_id=i,
+                source=src,
+                width=self.capture_width,
+                height=self.capture_height,
+                fps=self.capture_fps,
+                buffer_size=self.buffer_size,
+                name=f"cam{i}"
+            )
+            rd.start()
+            self.readers.append(rd)
+        self.states_per_cam = [dict() for _ in self.readers]
+
+    def _stop_readers(self):
+        for rd in self.readers:
+            rd.stop()
+        self.readers = []
+
+    def _rule_fast_event(self, st: TrackState, m: Dict[str, float], frame_ts: float) -> Tuple[bool, Dict[str, float]]:
+        """
+        规则法快速倒下事件：角速度 / 归一化下落速度 / 宽高比变化速度
+        返回 fast_event 及调试值
+        """
+        body_ang = m["body_ang"]
+        wh_ratio = m["wh_ratio"]
+        bh = max(1.0, m["bh"])
+        cy = m["cy"]
+
+        dt = 0.0
+        ang_speed = 0.0
+        vy_norm = 0.0
+        wh_speed = 0.0
+
+        if st.prev_ts > 0.0:
+            dt = max(1e-3, frame_ts - st.prev_ts)
+            ang_speed = (body_ang - st.prev_body_ang) / dt
+
+            vy = (cy - st.prev_cy) / dt
+            vy_norm = vy / bh
+
+            wh_speed = (wh_ratio - st.prev_wh_ratio) / dt
+
+        is_standlike = body_ang < self.ang_stand_max
+
+        fast_event = False
+        if dt > 0.0:
+            if ang_speed > self.ang_speed_th:
+                fast_event = True
+            if vy_norm > self.vy_norm_th:
+                fast_event = True
+            if wh_speed > self.wh_speed_th:
+                fast_event = True
+
+            # 竖直到水平的跃迁（再加一道更严格门槛）
+            if st.prev_is_standlike and (body_ang > self.ang_lying_min) and (dt < 0.7):
+                if (ang_speed > (0.8 * self.ang_speed_th)) or (wh_speed > (0.8 * self.wh_speed_th)):
+                    fast_event = True
+
+        # 更新上一帧
+        st.prev_ts = frame_ts
+        st.prev_body_ang = body_ang
+        st.prev_cy = cy
+        st.prev_wh_ratio = wh_ratio
+        st.prev_is_standlike = is_standlike
+
+        dbg = {
+            "dt": dt,
+            "ang_speed": ang_speed,
+            "vy_norm": vy_norm,
+            "wh_speed": wh_speed,
+        }
+        return fast_event, dbg
+
+    def _ml_event_prob(self, st: TrackState) -> float:
+        """
+        训练模型输出“摔倒”概率（越大越像摔倒事件）
+        """
+        if self.clf is None:
+            return 0.0
+        window_list = list(st.window)
+        feats = build_clip_feature_from_window(window_list, self.ml_sample_fps).reshape(1, -1)
+        try:
+            proba = float(self.clf.predict_proba(feats)[0, 1])
+            return proba
+        except Exception:
+            # 有些模型可能没有 predict_proba
+            try:
+                pred = int(self.clf.predict(feats)[0])
+                return 1.0 if pred == 1 else 0.0
+            except Exception:
+                return 0.0
+
+    def run(self):
+        try:
+            self._load_models()
+        except Exception as e:
+            self.last_status_text = f"启动失败：{e}"
+            print("[错误]", self.last_status_text)
+            return
+
+        self._start_readers()
+
+        cv2.namedWindow("Video", cv2.WINDOW_NORMAL)
+
+        last_fps_ts = time.time()
+        loop_frames = 0
+        loop_fps = 0.0
+
+        try:
+            while not self.stop_flag:
+                # 批量取帧
+                batch_frames = []
+                batch_meta = []  # (cam_i, frame_ts)
+                for cam_i, rd in enumerate(self.readers):
+                    frame, ts = rd.get_latest()
+                    if frame is None:
+                        continue
+                    batch_frames.append(frame)
+                    batch_meta.append((cam_i, ts))
+
+                if not batch_frames:
+                    time.sleep(0.01)
+                    continue
+
+                # 批量推理（track 保持 ID）
+                results = self.model.track(
+                    source=batch_frames,
+                    stream=False,
+                    device=self.device,
+                    half=self.use_half,
+                    imgsz=self.infer_imgsz,
+                    conf=self.conf_thres,
                     verbose=False,
+                    persist=True,
                 )
 
-                for pr, (tid, ox, oy, cw, ch) in zip(pose_results, meta):
-                    head = None
+                now = time.time()
+                annotated_frames = []
 
-                    if getattr(pr, "keypoints", None) is not None and pr.keypoints is not None:
-                        try:
-                            kxy_all = pr.keypoints.xy.cpu().numpy()
-                        except Exception:
-                            kxy_all = None
-                        try:
-                            kconf_all = pr.keypoints.conf.cpu().numpy()
-                        except Exception:
-                            kconf_all = None
+                for idx, res in enumerate(results):
+                    cam_i, frame_ts = batch_meta[idx]
+                    frame = batch_frames[idx]
+                    h, w = frame.shape[:2]
 
-                        if kxy_all is not None and len(kxy_all) > 0:
-                            best_i = pick_best_pose_index(pr, cw, ch)
-                            best_i = int(max(0, min(len(kxy_all) - 1, best_i)))
+                    # 清理过期 track
+                    stmap = self.states_per_cam[cam_i]
+                    stale = [tid for tid, st in stmap.items() if (now - st.last_seen_ts) > 5.0]
+                    for tid in stale:
+                        stmap.pop(tid, None)
 
-                            kxy = kxy_all[best_i]
-                            kconf = None
-                            if kconf_all is not None and len(kconf_all) > best_i:
-                                kconf = kconf_all[best_i]
+                    boxes = getattr(res, "boxes", None)
+                    kpts = getattr(res, "keypoints", None)
 
-                            # ROI 坐标系下更紧的整头框
-                            hx1, hy1, hx2, hy2 = head_box_full_from_pose(cw, ch, kxy, kconf)
+                    if boxes is None or kpts is None or len(boxes) == 0:
+                        cv2.putText(frame, f"CAM{cam_i} no person", (15, 35),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
+                        annotated_frames.append(frame)
+                        continue
 
-                            # 映射回原图
-                            hx1 += ox
-                            hx2 += ox
-                            hy1 += oy
-                            hy2 += oy
-                            hx1, hy1, hx2, hy2 = clamp_box_draw(hx1, hy1, hx2, hy2, W, H)
-                            head = np.array([hx1, hy1, hx2, hy2], dtype=np.float32)
+                    xyxy = boxes.xyxy.cpu().numpy()
+                    confs = boxes.conf.cpu().numpy() if boxes.conf is not None else np.ones((len(xyxy),), dtype=np.float32)
 
-                    if head is None:
-                        pbox, _ = tracks[tid]
-                        hx1, hy1, hx2, hy2 = head_box_fallback_full(*pbox.tolist())
-                        hx1, hy1, hx2, hy2 = clamp_box_draw(hx1, hy1, hx2, hy2, W, H)
-                        head = np.array([hx1, hy1, hx2, hy2], dtype=np.float32)
+                    # 跟踪ID（无则临时）
+                    ids = None
+                    try:
+                        if boxes.id is not None:
+                            ids = boxes.id.cpu().numpy().astype(int)
+                    except Exception:
+                        ids = None
 
-                    # EMA 平滑（仅对有稳定 tid 的人）
-                    if tid in head_state:
-                        prev = head_state[tid]
-                        if iou(prev, head) < IOU_RESET_THRESH:
-                            head_state[tid] = head
+                    kpts_xy_all = kpts.xy.cpu().numpy()  # (N,17,2)
+
+                    for j in range(len(xyxy)):
+                        tid = int(ids[j]) if (ids is not None and j < len(ids)) else int(100000 + j)
+
+                        st = stmap.get(tid, TrackState(window=deque(maxlen=int(self.ml_sample_fps * 2))))
+                        st.last_seen_ts = now
+
+                        # 计算 metrics
+                        m = calc_pose_metrics(kpts_xy_all[j], xyxy[j])
+
+                        # 躺姿（单帧）
+                        m["lying_like"] = is_lying_like(
+                            m,
+                            wh_th=self.wh_ratio_lying_th,
+                            ang_th=self.ang_lying_min,
+                            headhip_rel_th=self.head_hip_v_rel_th,
+                            score_th=self.lying_score_th
+                        )
+
+                        # 更新滑动窗口（用于 ML）
+                        # 为了近似 SAMPLE_FPS，我们按“时间间隔”抽样存入 window
+                        if len(st.window) == 0:
+                            st.window.append(m)
                         else:
-                            head_state[tid] = ema_update(prev, head, HEAD_EMA_ALPHA)
-                    else:
-                        head_state[tid] = head
+                            # 控制窗口采样率：如果两次存入间隔 < 1/SAMPLE_FPS，就不存（降低重复）
+                            last_t = st.window[-1].get("_ts", 0.0)
+                            if last_t == 0.0 or (frame_ts - last_t) >= (1.0 / self.ml_sample_fps):
+                                m["_ts"] = frame_ts
+                                st.window.append(m)
 
-                    last_pose_update[tid] = frame_idx
+                        # 躺姿连续帧计数（严格：回退更强）
+                        if m["lying_like"]:
+                            st.consec_lying += 1
+                        else:
+                            st.consec_lying = max(0, st.consec_lying - 2)
 
-        # 3b) 无 tid：只计算本帧 head（不写入 head_state）
-        head_noid = []  # [(pbox, score, head_box)]
-        if need_pose_noid:
-            crops = []
-            meta = []  # (pbox, score, ox, oy, cw, ch)
-            for (pbox, score) in need_pose_noid:
-                crop, ox, oy = crop_with_pad(frame, pbox, CROP_PAD_RATIO)
-                if crop is None or crop.size == 0:
-                    continue
-                ch, cw = crop.shape[:2]
-                if cw < 10 or ch < 10:
-                    continue
-                crops.append(crop)
-                meta.append((pbox, score, ox, oy, cw, ch))
+                        # 三种模式：规则 / 训练模型 / 混合
+                        rule_fast, dbg_rule = self._rule_fast_event(st, m, frame_ts)
+                        if rule_fast:
+                            st.last_fall_event_ts = now
 
-            if crops:
-                pose_results = pose_model.predict(
-                    crops,
-                    conf=POSE_CONF,
-                    imgsz=POSE_IMGSZ,
-                    device=device,
-                    half=half_ok,
-                    verbose=False,
-                )
+                        in_rule_event_window = (now - st.last_fall_event_ts) <= self.fall_event_window_sec
+                        rule_is_fall = in_rule_event_window and (st.consec_lying >= self.fall_pose_consec_frames)
 
-                for pr, (pbox, score, ox, oy, cw, ch) in zip(pose_results, meta):
-                    head = None
-                    if getattr(pr, "keypoints", None) is not None and pr.keypoints is not None:
-                        try:
-                            kxy_all = pr.keypoints.xy.cpu().numpy()
-                        except Exception:
-                            kxy_all = None
-                        try:
-                            kconf_all = pr.keypoints.conf.cpu().numpy()
-                        except Exception:
-                            kconf_all = None
+                        ml_prob = self._ml_event_prob(st)
+                        ml_is_fall = (ml_prob >= self.ml_prob_thres) and (st.consec_lying >= self.fall_pose_consec_frames)
 
-                        if kxy_all is not None and len(kxy_all) > 0:
-                            best_i = pick_best_pose_index(pr, cw, ch)
-                            best_i = int(max(0, min(len(kxy_all) - 1, best_i)))
-                            kxy = kxy_all[best_i]
-                            kconf = None
-                            if kconf_all is not None and len(kconf_all) > best_i:
-                                kconf = kconf_all[best_i]
+                        if self.algo_mode == "规则":
+                            is_fall = rule_is_fall
+                            algo_tag = "RULE"
+                        elif self.algo_mode == "训练模型":
+                            # 训练模型模式：只信 ML（误报优先：阈值很高）
+                            is_fall = ml_is_fall
+                            algo_tag = "ML"
+                        else:
+                            # 混合模式（最稳）：规则快速事件 + ML 概率双重通过
+                            is_fall = rule_is_fall and (ml_prob >= (self.ml_prob_thres * 0.9))
+                            algo_tag = "HYB"
 
-                            hx1, hy1, hx2, hy2 = head_box_full_from_pose(cw, ch, kxy, kconf)
-                            hx1 += ox
-                            hx2 += ox
-                            hy1 += oy
-                            hy2 += oy
-                            hx1, hy1, hx2, hy2 = clamp_box_draw(hx1, hy1, hx2, hy2, W, H)
-                            head = np.array([hx1, hy1, hx2, hy2], dtype=np.float32)
+                        # 画框
+                        x1, y1, x2, y2 = int(m["box_x1"]), int(m["box_y1"]), int(m["box_x2"]), int(m["box_y2"])
+                        if is_fall:
+                            color = (0, 0, 255)
+                        elif m["lying_like"]:
+                            color = (0, 200, 255)
+                        else:
+                            color = (0, 255, 0)
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
 
-                    if head is None:
-                        hx1, hy1, hx2, hy2 = head_box_fallback_full(*pbox.tolist())
-                        hx1, hy1, hx2, hy2 = clamp_box_draw(hx1, hy1, hx2, hy2, W, H)
-                        head = np.array([hx1, hy1, hx2, hy2], dtype=np.float32)
+                        # 叠加调试文字（方便你现场调参）
+                        txt1 = f"{algo_tag} CAM{cam_i} ID:{tid} conf:{confs[j]:.2f} ang:{m['body_ang']:.1f} lieN:{st.consec_lying}"
+                        txt2 = f"angSp:{dbg_rule['ang_speed']:.0f} vyN:{dbg_rule['vy_norm']:.2f} whSp:{dbg_rule['wh_speed']:.2f} mlP:{ml_prob:.2f}"
+                        cv2.putText(frame, txt1, (x1, max(0, y1 - 26)),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                        cv2.putText(frame, txt2, (x1, max(0, y1 - 6)),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-                    head_noid.append((pbox, score, head))
+                        # 画关键点（点）
+                        pts = kpts_xy_all[j].astype(int)
+                        for p in pts:
+                            cv2.circle(frame, (p[0], p[1]), 2, (255, 255, 0), -1)
 
-        # 4) 绘制（不显示 id）
-        # 4a) 有 tid
-        if tracks:
-            for tid, (pbox, score) in tracks.items():
-                px1, py1, px2, py2 = pbox.tolist()
+                        # 推送（冷却）
+                        if is_fall and ((now - st.last_push_ts) >= self.push_cooldown_sec):
+                            st.last_push_ts = now
+                            tstr = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now))
+                            content = f"""
+                            <b>检测到疑似摔倒（{algo_tag}，误报优先严格）！</b><br>
+                            摄像头：CAM{cam_i}<br>
+                            时间：{tstr}<br>
+                            目标ID：{tid}<br>
+                            躺姿连续帧：{st.consec_lying}<br>
+                            角度：{m['body_ang']:.1f}°<br>
+                            角速度：{dbg_rule['ang_speed']:.0f}°/s<br>
+                            归一化下落速度：{dbg_rule['vy_norm']:.2f} (框高)/s<br>
+                            宽高比变化速度：{dbg_rule['wh_speed']:.2f} /s<br>
+                            训练模型摔倒概率：{ml_prob:.2f}<br>
+                            """
 
-                # 人框
-                ix1, iy1, ix2, iy2 = map(int, [px1, py1, px2, py2])
-                cv2.rectangle(frame, (ix1, iy1), (ix2, iy2), (0, 255, 0), 2)
-                cv2.putText(
-                    frame,
-                    f"human {score:.2f}",
-                    (ix1, max(15, iy1 - 6)),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6,
-                    (0, 255, 0),
-                    2
-                )
+                            if self.push_token and ("请在这里填写" not in self.push_token):
+                                ok = pushplus_send(self.push_token, "⚠️ 摔倒告警", content)
+                                print(f"[推送] CAM{cam_i} ID{tid} -> {'成功' if ok else '失败'}")
+                            else:
+                                print(f"[告警模拟] CAM{cam_i} ID{tid} {tstr}")
 
-                # 头框
-                if tid in head_state:
-                    hx1, hy1, hx2, hy2 = head_state[tid].tolist()
-                else:
-                    hx1, hy1, hx2, hy2 = head_box_fallback_full(px1, py1, px2, py2)
+                        stmap[tid] = st
 
-                hx1, hy1, hx2, hy2 = clamp_box_draw(hx1, hy1, hx2, hy2, W, H)
-                jx1, jy1, jx2, jy2 = map(int, [hx1, hy1, hx2, hy2])
-                cv2.rectangle(frame, (jx1, jy1), (jx2, jy2), (0, 0, 255), 2)
-                cv2.putText(
-                    frame,
-                    "head",
-                    (jx1, max(15, jy1 - 6)),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6,
-                    (0, 0, 255),
-                    2
-                )
+                    cv2.putText(frame, f"CAM{cam_i} {w}x{h}", (15, 35),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
+                    annotated_frames.append(frame)
 
-        # 4b) 无 tid（本帧结果）
-        if head_noid:
-            for (pbox, score, head) in head_noid:
-                px1, py1, px2, py2 = pbox.tolist()
-                ix1, iy1, ix2, iy2 = map(int, [px1, py1, px2, py2])
-                cv2.rectangle(frame, (ix1, iy1), (ix2, iy2), (0, 255, 0), 2)
-                cv2.putText(
-                    frame,
-                    f"human {score:.2f}",
-                    (ix1, max(15, iy1 - 6)),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6,
-                    (0, 255, 0),
-                    2
-                )
+                # FPS
+                loop_frames += 1
+                if time.time() - last_fps_ts >= 1.0:
+                    loop_fps = loop_frames / (time.time() - last_fps_ts)
+                    loop_frames = 0
+                    last_fps_ts = time.time()
 
-                hx1, hy1, hx2, hy2 = head.tolist()
-                hx1, hy1, hx2, hy2 = clamp_box_draw(hx1, hy1, hx2, hy2, W, H)
-                jx1, jy1, jx2, jy2 = map(int, [hx1, hy1, hx2, hy2])
-                cv2.rectangle(frame, (jx1, jy1), (jx2, jy2), (0, 0, 255), 2)
-                cv2.putText(
-                    frame,
-                    "head",
-                    (jx1, max(15, jy1 - 6)),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6,
-                    (0, 0, 255),
-                    2
-                )
+                canvas = mosaic(annotated_frames, target_w=1600)
+                info = f"FPS:{loop_fps:.1f} imgsz:{self.infer_imgsz} device:{self.device} algo:{self.algo_mode} mlTH:{self.ml_prob_thres:.2f}"
+                cv2.putText(canvas, info, (15, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
 
-        # 5) 清理 stale tracks（仅 tid）
-        if frame_idx % 10 == 0:
-            stale = [tid for tid, t in last_seen.items() if (frame_idx - t) > STALE_FRAMES]
-            for tid in stale:
-                last_seen.pop(tid, None)
-                head_state.pop(tid, None)
-                last_pose_update.pop(tid, None)
+                self.last_canvas = canvas
+                self.last_status_text = info
 
-        # 6) FPS
-        now = time.time()
-        dt = now - last_t
-        last_t = now
-        if dt > 0:
-            inst = 1.0 / dt
-            fps = 0.9 * fps + 0.1 * inst if fps > 0 else inst
+                cv2.imshow("Video", canvas)
+                key = cv2.waitKey(1) & 0xFF
+                if key == 27 or key == ord('q'):
+                    self.stop_flag = True
+                    break
 
-        cv2.putText(
-            frame,
-            f"Frame:{W}x{H}  det_scale:{det_scale:.2f}  FPS:{fps:.1f}  PoseStride:{POSE_STRIDE}  Quit:'-'/'ESC'",
-            (10, 30),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.75,
-            (255, 255, 255),
-            2
+        finally:
+            self._stop_readers()
+            try:
+                cv2.destroyWindow("Video")
+            except Exception:
+                pass
+            print("[信息] VideoProcessor 已停止。")
+
+
+# ===========================
+# Tkinter UI
+# ===========================
+
+class App:
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        self.root.title("摔倒检测控制面板（YOLOv11 Pose + 训练模型）")
+        self.processor: Optional[VideoProcessor] = None
+
+        # 默认参数（你可以改）
+        self.var_push_token = tk.StringVar(value="请在这里填写你的pushplus_token")
+        self.var_yolo_model = tk.StringVar(value="yolo11n-pose.pt")
+        self.var_clf_path = tk.StringVar(value="fall_event_clf.joblib")
+
+        self.var_algo = tk.StringVar(value="混合")  # 规则/训练模型/混合
+
+        self.var_imgsz = tk.IntVar(value=960)
+        self.var_conf = tk.DoubleVar(value=0.40)
+        self.var_half = tk.BooleanVar(value=True)
+
+        self.var_pose_consec = tk.IntVar(value=12)
+        self.var_event_window = tk.DoubleVar(value=1.0)
+        self.var_push_cd = tk.IntVar(value=45)
+
+        self.var_ml_prob = tk.DoubleVar(value=0.90)
+        self.var_ml_fps = tk.DoubleVar(value=10.0)
+
+        self.var_cap_w = tk.IntVar(value=1920)
+        self.var_cap_h = tk.IntVar(value=1080)
+        self.var_cap_fps = tk.IntVar(value=30)
+        self.var_buf = tk.IntVar(value=1)
+
+        self.start_time = None
+        self.timer_job = None
+
+        self._build_ui()
+
+    def _build_ui(self):
+        pad = {"padx": 8, "pady": 6}
+
+        frm = ttk.Frame(self.root)
+        frm.pack(fill="both", expand=True, **pad)
+
+        # 摄像头源
+        ttk.Label(frm, text="摄像头源（每行一个：本地用 0/1，RTSP 用 rtsp://... ）").grid(row=0, column=0, columnspan=3, sticky="w")
+        self.txt_sources = tk.Text(frm, width=70, height=6)
+        self.txt_sources.grid(row=1, column=0, columnspan=3, sticky="we")
+        self.txt_sources.insert("1.0", "0\n")
+
+        # 模型选择
+        ttk.Label(frm, text="YOLO Pose 模型：").grid(row=2, column=0, sticky="e")
+        yolo_entry = ttk.Entry(frm, textvariable=self.var_yolo_model, width=45)
+        yolo_entry.grid(row=2, column=1, sticky="we")
+        ttk.Button(frm, text="选择文件", command=self._pick_yolo).grid(row=2, column=2, sticky="we")
+
+        ttk.Label(frm, text="训练模型 joblib：").grid(row=3, column=0, sticky="e")
+        clf_entry = ttk.Entry(frm, textvariable=self.var_clf_path, width=45)
+        clf_entry.grid(row=3, column=1, sticky="we")
+        ttk.Button(frm, text="选择文件", command=self._pick_clf).grid(row=3, column=2, sticky="we")
+
+        # 算法模式
+        ttk.Label(frm, text="算法模式：").grid(row=4, column=0, sticky="e")
+        algo_combo = ttk.Combobox(frm, textvariable=self.var_algo, values=["规则", "训练模型", "混合"], state="readonly")
+        algo_combo.grid(row=4, column=1, sticky="w")
+
+        # pushplus
+        ttk.Label(frm, text="pushplus token：").grid(row=5, column=0, sticky="e")
+        ttk.Entry(frm, textvariable=self.var_push_token, width=45).grid(row=5, column=1, sticky="we")
+        ttk.Button(frm, text="测试推送", command=self._test_push).grid(row=5, column=2, sticky="we")
+
+        # 推理参数
+        sep1 = ttk.Separator(frm, orient="horizontal")
+        sep1.grid(row=6, column=0, columnspan=3, sticky="we", pady=8)
+
+        ttk.Label(frm, text="imgsz：").grid(row=7, column=0, sticky="e")
+        ttk.Entry(frm, textvariable=self.var_imgsz, width=10).grid(row=7, column=1, sticky="w")
+        ttk.Label(frm, text="conf：").grid(row=7, column=1, sticky="e", padx=(140, 0))
+        ttk.Entry(frm, textvariable=self.var_conf, width=10).grid(row=7, column=2, sticky="w")
+        ttk.Checkbutton(frm, text="half(GPU)", variable=self.var_half).grid(row=8, column=1, sticky="w")
+
+        # 误报优先参数（关键）
+        ttk.Label(frm, text="躺姿连续帧：").grid(row=9, column=0, sticky="e")
+        ttk.Entry(frm, textvariable=self.var_pose_consec, width=10).grid(row=9, column=1, sticky="w")
+        ttk.Label(frm, text="事件窗口(s)：").grid(row=9, column=1, sticky="e", padx=(140, 0))
+        ttk.Entry(frm, textvariable=self.var_event_window, width=10).grid(row=9, column=2, sticky="w")
+
+        ttk.Label(frm, text="推送冷却(s)：").grid(row=10, column=0, sticky="e")
+        ttk.Entry(frm, textvariable=self.var_push_cd, width=10).grid(row=10, column=1, sticky="w")
+
+        # ML 参数
+        ttk.Label(frm, text="ML摔倒概率阈值：").grid(row=11, column=0, sticky="e")
+        ttk.Entry(frm, textvariable=self.var_ml_prob, width=10).grid(row=11, column=1, sticky="w")
+        ttk.Label(frm, text="ML窗口采样fps：").grid(row=11, column=1, sticky="e", padx=(140, 0))
+        ttk.Entry(frm, textvariable=self.var_ml_fps, width=10).grid(row=11, column=2, sticky="w")
+
+        # 采集参数
+        sep2 = ttk.Separator(frm, orient="horizontal")
+        sep2.grid(row=12, column=0, columnspan=3, sticky="we", pady=8)
+
+        ttk.Label(frm, text="采集宽：").grid(row=13, column=0, sticky="e")
+        ttk.Entry(frm, textvariable=self.var_cap_w, width=10).grid(row=13, column=1, sticky="w")
+        ttk.Label(frm, text="采集高：").grid(row=13, column=1, sticky="e", padx=(140, 0))
+        ttk.Entry(frm, textvariable=self.var_cap_h, width=10).grid(row=13, column=2, sticky="w")
+
+        ttk.Label(frm, text="采集FPS：").grid(row=14, column=0, sticky="e")
+        ttk.Entry(frm, textvariable=self.var_cap_fps, width=10).grid(row=14, column=1, sticky="w")
+        ttk.Label(frm, text="缓冲：").grid(row=14, column=1, sticky="e", padx=(140, 0))
+        ttk.Entry(frm, textvariable=self.var_buf, width=10).grid(row=14, column=2, sticky="w")
+
+        # 控制按钮 + 计时器
+        sep3 = ttk.Separator(frm, orient="horizontal")
+        sep3.grid(row=15, column=0, columnspan=3, sticky="we", pady=8)
+
+        self.btn_start = ttk.Button(frm, text="开始", command=self.start)
+        self.btn_start.grid(row=16, column=0, sticky="we")
+
+        self.btn_stop = ttk.Button(frm, text="结束", command=self.stop, state="disabled")
+        self.btn_stop.grid(row=16, column=1, sticky="we")
+
+        self.lbl_timer = ttk.Label(frm, text="计时：00:00:00")
+        self.lbl_timer.grid(row=16, column=2, sticky="e")
+
+        self.lbl_status = ttk.Label(frm, text="状态：未运行")
+        self.lbl_status.grid(row=17, column=0, columnspan=3, sticky="w")
+
+        frm.columnconfigure(1, weight=1)
+
+    def _pick_yolo(self):
+        fp = filedialog.askopenfilename(title="选择 YOLO Pose 模型文件", filetypes=[("PyTorch", "*.pt"), ("All", "*.*")])
+        if fp:
+            self.var_yolo_model.set(fp)
+
+    def _pick_clf(self):
+        fp = filedialog.askopenfilename(title="选择 训练模型 joblib 文件", filetypes=[("Joblib", "*.joblib"), ("All", "*.*")])
+        if fp:
+            self.var_clf_path.set(fp)
+
+    def _test_push(self):
+        token = self.var_push_token.get().strip()
+        if (not token) or ("请在这里填写" in token):
+            messagebox.showwarning("提示", "请先填写 pushplus token。")
+            return
+        ok = pushplus_send(token, "✅ pushplus 测试", "<b>测试推送成功</b>")
+        messagebox.showinfo("结果", "推送成功" if ok else "推送失败（请检查 token / 网络）")
+
+    def _parse_sources(self) -> List[str]:
+        raw = self.txt_sources.get("1.0", "end").strip().splitlines()
+        sources = []
+        for line in raw:
+            s = line.strip()
+            if not s:
+                continue
+            # 支持写 0/1 这类本地摄像头
+            if s.isdigit():
+                sources.append(int(s))
+            else:
+                sources.append(s)
+        return sources
+
+    def start(self):
+        if self.processor is not None and self.processor.is_alive():
+            messagebox.showinfo("提示", "已经在运行中。")
+            return
+
+        # 强制 CUDA：提前给用户明确提示
+        try:
+            import torch
+            if not (torch.cuda.is_available() and torch.cuda.device_count() > 0):
+                messagebox.showerror("CUDA 不可用",
+                                     "检测不到 CUDA。\n\n"
+                                     "请确认：\n"
+                                     "1) 已安装 cu128 版 torch（不是 +cpu）\n"
+                                     "2) nvidia-smi 能正常显示显卡\n"
+                                     "3) 你的虚拟环境里没有混装多个 torch\n")
+                return
+        except Exception as e:
+            messagebox.showerror("错误", f"无法检查 CUDA：{e}")
+            return
+
+        sources = self._parse_sources()
+        if not sources:
+            messagebox.showwarning("提示", "请至少填写一个摄像头源。")
+            return
+
+        yolo_path = self.var_yolo_model.get().strip()
+        if not yolo_path:
+            messagebox.showwarning("提示", "请填写 YOLO 模型路径。")
+            return
+
+        algo_mode = self.var_algo.get().strip()
+        clf_path = self.var_clf_path.get().strip()
+
+        # 训练模型模式必须有 joblib
+        if algo_mode in ("训练模型", "混合"):
+            if (not clf_path) or (not os.path.isfile(clf_path)):
+                messagebox.showwarning("提示", "你选择了训练模型/混合模式，但 joblib 文件不存在。\n请先选择训练模型文件。")
+                return
+
+        self.processor = VideoProcessor(
+            sources=sources,
+            yolo_model_path=yolo_path,
+            algo_mode=algo_mode,
+            clf_path=clf_path,
+            push_token=self.var_push_token.get().strip(),
+
+            infer_imgsz=int(self.var_imgsz.get()),
+            conf_thres=float(self.var_conf.get()),
+            use_half=bool(self.var_half.get()),
+
+            capture_width=int(self.var_cap_w.get()),
+            capture_height=int(self.var_cap_h.get()),
+            capture_fps=int(self.var_cap_fps.get()),
+            buffer_size=int(self.var_buf.get()),
+
+            fall_pose_consec_frames=int(self.var_pose_consec.get()),
+            fall_event_window_sec=float(self.var_event_window.get()),
+            push_cooldown_sec=int(self.var_push_cd.get()),
+
+            ml_prob_thres=float(self.var_ml_prob.get()),
+            ml_sample_fps=float(self.var_ml_fps.get()),
         )
 
-        cv2.imshow(win_name, frame)
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord("-") or key == 27:  # '-' or ESC
-            break
+        self.processor.start()
+        self.btn_start.config(state="disabled")
+        self.btn_stop.config(state="normal")
+        self.lbl_status.config(text="状态：运行中（视频窗口已打开，按 q 或 ESC 也可退出）")
 
-        frame = None
-        frame_idx += 1
+        self.start_time = time.time()
+        self._tick_timer()
+        self._poll_status()
 
-    cap.release()
-    cv2.destroyAllWindows()
+    def stop(self):
+        if self.processor is not None:
+            self.processor.stop()
+        self.processor = None
+
+        self.btn_start.config(state="normal")
+        self.btn_stop.config(state="disabled")
+        self.lbl_status.config(text="状态：已停止")
+
+        if self.timer_job is not None:
+            self.root.after_cancel(self.timer_job)
+            self.timer_job = None
+        self.lbl_timer.config(text="计时：00:00:00")
+
+    def _tick_timer(self):
+        if self.start_time is None:
+            return
+        elapsed = int(time.time() - self.start_time)
+        hh = elapsed // 3600
+        mm = (elapsed % 3600) // 60
+        ss = elapsed % 60
+        self.lbl_timer.config(text=f"计时：{hh:02d}:{mm:02d}:{ss:02d}")
+        self.timer_job = self.root.after(500, self._tick_timer)
+
+    def _poll_status(self):
+        # 定时刷新状态文本
+        if self.processor is not None:
+            if (not self.processor.is_alive()):
+                # 线程自己退出了（例如按了 q 或异常）
+                msg = self.processor.last_status_text or "已退出"
+                self.stop()
+                messagebox.showinfo("提示", f"检测线程已停止：{msg}")
+                return
+            else:
+                if self.processor.last_status_text:
+                    self.lbl_status.config(text=f"状态：{self.processor.last_status_text}")
+        self.root.after(500, self._poll_status)
+
+
+def main():
+    # 尽量避免 Windows 控制台编码问题
+    os.environ.setdefault("PYTHONUTF8", "1")
+
+    root = tk.Tk()
+    app = App(root)
+
+    def on_close():
+        try:
+            app.stop()
+        except Exception:
+            pass
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", on_close)
+    root.mainloop()
 
 
 if __name__ == "__main__":
