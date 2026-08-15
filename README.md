@@ -70,6 +70,19 @@ pip install lapx
 
 如需启用 GPU，请确保已安装支持 CUDA 的 PyTorch，并且 `nvidia-smi` 能正常识别显卡。
 
+### Windows PowerShell 快速启动
+
+在项目根目录打开 PowerShell 后，可依次执行：
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install ultralytics opencv-python pyyaml numpy requests scikit-learn joblib lapx
+python view.py
+```
+
+如果 PowerShell 禁止执行激活脚本，可改用 `.\.venv\Scripts\python.exe view.py` 直接运行。
+
 ---
 
 ## 训练流程
